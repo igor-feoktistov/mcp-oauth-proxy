@@ -1,0 +1,46 @@
+{{- $oauth2 := .Values.authorization.oauth2 -}}
+{{- $client := first $oauth2.oauth2Client -}}
+{{ include "mcp-oauth-proxy.fullname" . }} is deployed.
+
+MCP endpoint:         {{ $oauth2.resource }}
+Resource metadata:    {{ $oauth2.resource | trimSuffix "/" }}/.well-known/oauth-protected-resource
+Authorization server: {{ default "https://login.microsoftonline.com" $client.authority }}/{{ $client.tenantID }}/v2.0
+
+Access is granted solely by Entra ID group membership, resolved through Microsoft
+Graph. A caller must be a transitive member of one of:
+{{- range $oauth2.allowGroups }}
+  - {{ . }}
+{{- end }}
+
+Verify the discovery challenge (expect HTTP 401 with a WWW-Authenticate header):
+
+  curl -i {{ $oauth2.resource }}
+
+Call with a token:
+
+  az account get-access-token --scope {{ first (default (list (printf "api://%s" $client.clientID)) $client.audience) }}/.default --query accessToken -o tsv
+
+{{ if eq .Values.graphCredential.type "federated" -}}
+Before the proxy can resolve groups, federate the service account with Entra ID:
+
+  az identity federated-credential create \
+    --name {{ include "mcp-oauth-proxy.fullname" . }} \
+    --identity-name <managed-identity> \
+    --resource-group <rg> \
+    --issuer <cluster-oidc-issuer-url> \
+    --subject system:serviceaccount:{{ .Release.Namespace }}:{{ include "mcp-oauth-proxy.serviceAccountName" . }} \
+    --audience api://AzureADTokenExchange
+
+The identity {{ .Values.graphCredential.clientId }} needs the GroupMember.Read.All
+*application* permission with admin consent granted.
+{{- else -}}
+The app registration {{ .Values.graphCredential.clientId }} needs the
+GroupMember.Read.All *application* permission with admin consent granted.
+{{- end }}
+{{- if not $oauth2.dynamicClientRegistration.enabled }}
+
+NOTE: dynamic client registration is disabled. MCP clients that rely on RFC 7591
+must be given a pre-registered client id, or set
+authorization.oauth2.dynamicClientRegistration.enabled=true with a
+pre-provisioned public client.
+{{- end }}

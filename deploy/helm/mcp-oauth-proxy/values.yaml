@@ -1,0 +1,204 @@
+# -- Number of pod replicas.
+replicaCount: 2
+
+nameOverride: ""
+fullnameOverride: ""
+
+proxy:
+  image:
+    repository: ghcr.io/example/mcp-oauth-proxy
+    tag: ""        # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  # Extra environment variables. The Graph client secret, when used, is injected
+  # separately via `graphCredential` and must not be placed here.
+  extraEnv: []
+
+# The MCP server container. It must bind to 127.0.0.1 so that the proxy cannot
+# be bypassed from inside the cluster.
+mcpServer:
+  image:
+    repository: ghcr.io/example/my-mcp-server
+    tag: latest
+    pullPolicy: IfNotPresent
+  port: 3000
+  args:
+    - --host
+    - 127.0.0.1
+    - --port
+    - "3000"
+  env: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+server:
+  # -- Largest accepted request body. MCP tool arguments can be sizeable.
+  maxBodyBytes: 4194304
+  # -- Cap on the X-Mcp-Groups header the proxy forwards upstream. Transitive
+  # membership can run to hundreds of groups, which would overflow the 4-8 KiB
+  # header buffers of a typical ingress controller and surface as a 502.
+  maxGroupsHeaderBytes: 2048
+  # -- Browser origins allowed to call the MCP endpoint.
+  allowedOrigins: []
+
+logging:
+  level: info
+  format: json
+
+# The credential the proxy uses for Microsoft Graph when it resolves group
+# membership. How it is used depends on `authorization.oauth2.graph.flow`:
+# under app_permission (default) the proxy calls Graph as this identity, and
+# under obo it uses it to exchange the caller's token.
+graphCredential:
+  # -- federated (Azure AD Workload Identity, recommended) or secret.
+  type: federated
+
+  # -- Client id of the identity holding the GroupMember.Read.All permission:
+  # an app registration or user-assigned managed identity under app_permission,
+  # or - under obo - necessarily the same app registration as the oauth2Client,
+  # in which case it may be left empty and is filled in for you.
+  clientId: ""
+  # -- Directory the credential lives in. Defaults to the first oauth2Client's
+  # tenantID. Ignored under obo, which exchanges at the caller's own tenant.
+  tenantId: ""
+
+  # Only for type: secret. The value is read from a Secret, never from the
+  # ConfigMap, and reaches the proxy as the GRAPH_CLIENT_SECRET env var.
+  secret:
+    # -- Create a Secret from `value`. Prefer `existingSecret` in production.
+    create: false
+    value: ""
+    existingSecret: ""
+    key: clientSecret
+
+# Everything below is rendered verbatim into the proxy's config.yaml under
+# `authorization:`, so every field the proxy understands is available here.
+authorization:
+  oauth2:
+    # -- Canonical public https URI of the MCP endpoint; this is the OAuth
+    # resource identifier clients request a token for.
+    resource: ""
+    resourceName: MCP Server
+    resourceDocumentation: ""
+    # -- Advertised in protected resource metadata. Entra ID ignores the RFC 8707
+    # `resource` parameter, so clients must request `<app-id-uri>/<scope>`.
+    scopesSupported: []
+
+    # -- MANDATORY. A caller must be a transitive member of at least one of these
+    # groups before any request reaches the MCP server. Entries are group object
+    # ids, or `name:<displayName>` aliases resolved to object ids on first use.
+    allowGroups: []
+    # -- App roles accepted from app-only (daemon) callers, which have no group
+    # membership. Only consulted when allowAppOnly is true.
+    allowRoles: []
+    allowAppOnly: false
+
+    oauth2Client: []
+    # - issuer: ""                     # defaults to <authority>/<tenantID>/v2.0
+    #   authority: https://login.microsoftonline.com
+    #   tenantID: 00000000-0000-0000-0000-000000000000
+    #   clientID: 11111111-1111-1111-1111-111111111111
+    #   audience: ["api://11111111-1111-1111-1111-111111111111"]
+    #   allowedClientIDs: []           # optional azp/appid allow list
+    #   userLoginClaim: preferred_username
+    #   groupsSource: msgraph          # or jwt, to use the groups claim instead
+    #   acceptV1Tokens: true
+
+    # Shared by every oauth2Client using groupsSource: msgraph. One block, not
+    # one per application, because there is a single Graph credential for the
+    # deployment; it comes from `graphCredential` above.
+    graph: {}
+    #   flow: app_permission           # or obo, to read membership as the
+    #                                  # caller. Pick obo when your tenant will
+    #                                  # only grant *Delegated* Graph
+    #                                  # permissions; client credentials ignore
+    #                                  # those and every call returns 403.
+    #                                  # Under obo, app-only callers get no
+    #                                  # groups and `name:` aliases are
+    #                                  # unavailable, but other tenants are.
+    #   cacheTTL: 10m                  # also the group-removal propagation window
+    #   negativeCacheTTL: 30s
+    #   failureMode: closed            # or stale
+    #   staleGracePeriod: 1h
+
+    userLoginTransformer: {}
+    #   matchRegexp: '^(.*)@contoso\.com$'
+    #   replaceRegexp: '$1'
+
+    # Entra ID does not implement RFC 7591. Enable the shim to hand MCP clients a
+    # pre-provisioned public client id so their registration step succeeds.
+    dynamicClientRegistration:
+      enabled: false
+      staticClientID: ""
+      mirrorAuthorizationServerMetadata: true
+
+  policy:
+    # -- Effect applied when no rule matches.
+    defaultEffect: deny
+    # -- Inline rules, evaluated first-match-wins.
+    rules: []
+    # - name: read-only
+    #   effect: allow
+    #   methods: ["initialize", "ping", "tools/list", "resources/*"]
+    #   groups: ["name:mcp-readers"]
+
+  # -- Render the policy into its own ConfigMap so it can be changed without
+  # touching the credentials and endpoints in the main configuration.
+  separatePolicyConfigMap: false
+  # -- Use an existing ConfigMap with a rules.yaml key instead of the inline rules.
+  existingPolicyConfigMap: ""
+
+service:
+  type: ClusterIP
+  port: 443
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  host: ""
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: true
+    secretName: ""
+
+networkPolicy:
+  enabled: true
+  ingressNamespace: ingress-nginx
+  monitoringNamespace: monitoring
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+imagePullSecrets: []

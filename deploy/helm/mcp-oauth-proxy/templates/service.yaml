@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mcp-oauth-proxy.fullname" . }}
+  labels:
+    {{- include "mcp-oauth-proxy.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "mcp-oauth-proxy.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mcp-oauth-proxy.fullname" . }}-metrics
+  labels:
+    {{- include "mcp-oauth-proxy.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "mcp-oauth-proxy.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+{{- if .Values.serviceAccount.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "mcp-oauth-proxy.serviceAccountName" . }}
+  labels:
+    {{- include "mcp-oauth-proxy.labels" . | nindent 4 }}
+  {{- if or .Values.serviceAccount.annotations (eq .Values.graphCredential.type "federated") }}
+  annotations:
+    {{- if eq .Values.graphCredential.type "federated" }}
+    # Consumed by the Azure Workload Identity webhook, which projects a service
+    # account token and exposes it as AZURE_FEDERATED_TOKEN_FILE.
+    azure.workload.identity/client-id: {{ .Values.graphCredential.clientId | quote }}
+    azure.workload.identity/tenant-id: {{ default (first .Values.authorization.oauth2.oauth2Client).tenantID .Values.graphCredential.tenantId | quote }}
+    {{- end }}
+    {{- with .Values.serviceAccount.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+{{- end }}

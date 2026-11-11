@@ -1,0 +1,206 @@
+# A complete mcp-oauth-proxy configuration, annotated.
+#
+# Access is decided entirely by Entra ID group membership, resolved through
+# Microsoft Graph. Delegated scopes are not used for authorization: a scope only
+# tells you which permission a client asked for, not who the caller is, and any
+# client in the tenant can ask for one.
+
+server:
+  listenAddr: ":8080"
+  metricsAddr: ":9090"
+  # MCP tool arguments can be large, but an unbounded body is a denial of
+  # service vector against both the proxy and the MCP server behind it.
+  maxBodyBytes: 4194304
+  # A user can easily be a transitive member of several hundred groups. The
+  # forwarded X-Mcp-Groups header is capped here, and the proxy sets
+  # X-Mcp-Groups-Truncated when it had to cut the list short; without a cap the
+  # request would exceed an ingress controller's header buffers and fail as 502.
+  maxGroupsHeaderBytes: 2048
+  # Browser-based MCP clients only. Leave empty for CLI and desktop clients.
+  allowedOrigins:
+    - https://mcp-inspector.example.com
+
+upstream:
+  # The MCP server must bind to loopback so the proxy cannot be bypassed from
+  # inside the pod.
+  url: http://127.0.0.1:3000
+  # Long enough for slow tools, bounded so a hung tool cannot pin a connection
+  # forever. Streaming responses are not subject to this timeout.
+  timeout: 5m
+
+log:
+  level: info
+  format: json
+
+authorization:
+  oauth2:
+    # The canonical public URL of this MCP endpoint. It is the OAuth resource
+    # identifier, it is what clients put in the RFC 8707 `resource` parameter,
+    # and it fixes where the RFC 9728 metadata document is published.
+    resource: https://mcp.example.com/mcp
+    resourceName: Platform MCP Server
+    resourceDocumentation: https://wiki.example.com/mcp
+
+    # Advertised to clients in the protected resource metadata. Entra ID ignores
+    # the `resource` parameter, so a client must request `<app-id-uri>/<scope>`
+    # to get a token with the right `aud`. At least one delegated scope must
+    # therefore exist on the app registration even though the proxy never makes
+    # an authorization decision based on it.
+    scopesSupported:
+      - api://22222222-2222-2222-2222-222222222222/mcp.access
+
+    # MANDATORY. The coarse gate: a caller must be a transitive member of at
+    # least one of these groups before any request reaches the MCP server.
+    #
+    # Either a group object id or a "name:<display name>" alias. An alias is
+    # looked up in the directory once, on the first request that needs it, and
+    # from then on stands for the single object id it resolved to - a caller
+    # never matches on the display name their own groups happen to carry, so a
+    # user who creates a like-named group of their own gains nothing.
+    # Object ids are still cheaper: an alias costs one extra Graph call and
+    # needs permission to read group objects. An unknown or ambiguous name
+    # fails requests closed with a 500 naming the group, on the first request
+    # rather than at startup.
+    #
+    # Under graph.flow: obo the lookup runs with the caller's own rights, so a
+    # name that user cannot see is indistinguishable from one that does not
+    # exist. Prefer object ids there.
+    allowGroups:
+      - 6f0d8f0e-0000-0000-0000-000000000001     # mcp-users
+      - name:mcp-operators
+
+    # App-only (client-credentials) callers have no user and therefore no group
+    # membership, so they are gated on app roles instead. Both switches are
+    # needed: allowAppOnly admits them at all, allowRoles says which are trusted.
+    allowAppOnly: true
+    allowRoles:
+      - Mcp.Invoke.All
+
+    oauth2Client:
+      - authority: https://login.microsoftonline.com
+        tenantID: 11111111-1111-1111-1111-111111111111
+        clientID: 22222222-2222-2222-2222-222222222222
+        # Audience validation is what stops a token minted for another API being
+        # replayed here. Both forms are accepted because Entra ID mints either,
+        # depending on how the client asked for the token.
+        audience:
+          - api://22222222-2222-2222-2222-222222222222
+          - 22222222-2222-2222-2222-222222222222
+        # Optional: restrict which client applications may call at all.
+        allowedClientIDs:
+          - 33333333-3333-3333-3333-333333333333   # the MCP client
+
+        userLoginClaim: preferred_username
+        # msgraph (default) asks the directory. Use `jwt` only if you have
+        # configured a groups claim and accept its limits: Entra ID replaces the
+        # claim with a `_claim_names` overage reference once a user is in more
+        # than ~200 groups, and the list is frozen for the token's lifetime.
+        groupsSource: msgraph
+        acceptV1Tokens: true
+        clockSkew: 60s
+        jwksRefreshInterval: 15m
+
+
+    # Microsoft Graph is shared by every application above that uses
+    # groupsSource: msgraph. There is one block, not one per application,
+    # because the proxy calls Graph as itself rather than on behalf of the
+    # caller, and an app-only credential can only read its own directory.
+    graph:
+      # How the proxy authenticates to Microsoft Graph.
+      #
+      # app_permission (default): the proxy calls Graph as itself, using the
+      #   credential below. Needs the *Application* permission
+      #   GroupMember.Read.All with admin consent. Also covers app-only
+      #   callers, which have no user to act on behalf of.
+      #
+      # obo: the proxy exchanges the caller's own token for a Graph token and
+      #   reads membership as that user. Needs the *Delegated* permission
+      #   GroupMember.Read.All instead, which many tenants grant far more
+      #   readily. The credential must then belong to the same application as
+      #   the oauth2Client above (left unset below, it defaults to it).
+      #   Trade-offs: app-only callers get no groups, and each membership
+      #   cache miss costs one extra token exchange.
+      #flow: obo
+      # How long a resolved membership is reused. This is also the window in
+      # which a group removal has not yet taken effect, so it is a direct
+      # trade-off between directory load and revocation latency.
+      cacheTTL: 10m
+      # Failures are cached briefly too, so a Graph outage cannot turn into a
+      # request storm against the directory.
+      negativeCacheTTL: 30s
+      maxCacheEntries: 10000
+
+      # closed: if membership cannot be resolved, refuse the request (503).
+      # stale:  serve an expired cache entry for up to staleGracePeriod, so a
+      #         Graph outage does not take the MCP server down with it. This
+      #         widens the revocation window by the same amount.
+      failureMode: closed
+      staleGracePeriod: 1h
+
+      credential:
+        # Workload identity federation: no secret to store or rotate. The Azure
+        # Workload Identity webhook projects the service account token and sets
+        # AZURE_FEDERATED_TOKEN_FILE, which is the default here.
+        type: federated
+        clientID: 99999999-9999-9999-9999-999999999999
+        # Defaults to the first application's tenant. Any application using
+        # groupsSource: msgraph must live in this same tenant.
+        tenantID: 11111111-1111-1111-1111-111111111111
+        # For type: secret, name the environment variable instead. The secret
+        # itself never appears in this file.
+        # type: secret
+        # clientSecretEnv: GRAPH_CLIENT_SECRET
+
+    # Optional: rewrite the login before it is logged and forwarded upstream,
+    # for example to strip the domain from a UPN.
+    userLoginTransformer:
+      matchRegexp: '^(.+)@example\.com$'
+      replaceRegexp: '$1'
+
+    # Entra ID does not implement RFC 7591. MCP clients that insist on
+    # registering themselves get handed this pre-provisioned public client id so
+    # their registration step succeeds without a real registration endpoint.
+    dynamicClientRegistration:
+      enabled: true
+      staticClientID: 33333333-3333-3333-3333-333333333333
+      mirrorAuthorizationServerMetadata: true
+
+  # Fine-grained rules, evaluated in order, first match wins. Ordering is
+  # explicit and deterministic: a deny placed above the allows cannot be
+  # overtaken by a later rule, and the outcome never depends on the order in
+  # which the directory happened to return a user's groups.
+  policy:
+    defaultEffect: deny
+    rules:
+      # Destructive tools are denied first so no later allow can reach them.
+      - name: block-destructive-tools
+        effect: deny
+        methods: ["tools/call"]
+        tools: ["delete_*", "drain_node", "bash_*"]
+
+      # The handshake carries no privilege and must work for anyone who already
+      # passed the allowGroups gate, otherwise the session cannot start.
+      - name: protocol-handshake
+        effect: allow
+        methods: ["initialize", "initialized", "ping", "notifications/*"]
+
+      - name: readers
+        effect: allow
+        methods: ["tools/list", "resources/*", "prompts/*"]
+        groups:
+          - 6f0d8f0e-0000-0000-0000-000000000002   # mcp-readers
+
+      - name: operators
+        effect: allow
+        methods: ["tools/call"]
+        tools: ["kubectl_get*", "kubectl_describe*", "prometheus_*"]
+        groups:
+          - name:mcp-operators
+
+      # App-only callers are matched on roles; they have no groups to match.
+      - name: pipeline
+        effect: allow
+        appOnly: true
+        methods: ["tools/call", "tools/list"]
+        tools: ["kubectl_get*"]
+        roles: ["Mcp.Invoke.All"]

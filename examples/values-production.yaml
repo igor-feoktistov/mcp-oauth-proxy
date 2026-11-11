@@ -1,0 +1,147 @@
+# Production Helm values for a Kubernetes MCP server fronted by mcp-oauth-proxy.
+#
+#   helm upgrade --install platform-mcp deploy/helm/mcp-oauth-proxy \
+#     -n mcp --create-namespace -f examples/values-production.yaml
+
+replicaCount: 3
+
+proxy:
+  image:
+    repository: ghcr.io/example/mcp-oauth-proxy
+    tag: v0.1.0
+
+mcpServer:
+  image:
+    repository: ghcr.io/example/kubernetes-mcp-server
+    tag: v1.4.0
+  port: 3000
+  args: ["--host", "127.0.0.1", "--port", "3000"]
+
+server:
+  # Transitive membership can run to hundreds of groups; keep the forwarded
+  # header inside the ingress controller's buffers.
+  maxGroupsHeaderBytes: 2048
+  allowedOrigins: []
+
+logging:
+  level: info
+  format: json
+
+# Workload identity federation: nothing to store, nothing to rotate. The
+# identity below needs the GroupMember.Read.All *application* permission with
+# admin consent granted, and a federated credential whose subject is
+# system:serviceaccount:mcp:platform-mcp-mcp-oauth-proxy.
+graphCredential:
+  type: federated
+  clientId: 99999999-9999-9999-9999-999999999999
+  tenantId: 11111111-1111-1111-1111-111111111111
+
+authorization:
+  oauth2:
+    resource: https://mcp.example.com/mcp
+    resourceName: Platform MCP Server
+    resourceDocumentation: https://wiki.example.com/mcp
+    scopesSupported:
+      - api://22222222-2222-2222-2222-222222222222/mcp.access
+
+    # The coarse gate. Object ids are preferred over "name:" aliases because a
+    # display name is mutable and not unique.
+    allowGroups:
+      - 6f0d8f0e-0000-0000-0000-000000000001     # mcp-users
+
+    # CI pipelines authenticate as themselves, with no user and therefore no
+    # group membership, so they are gated on an app role instead.
+    allowAppOnly: true
+    allowRoles:
+      - Mcp.Invoke.All
+
+    oauth2Client:
+      - tenantID: 11111111-1111-1111-1111-111111111111
+        clientID: 22222222-2222-2222-2222-222222222222
+        audience:
+          - api://22222222-2222-2222-2222-222222222222
+          - 22222222-2222-2222-2222-222222222222
+        allowedClientIDs:
+          - 33333333-3333-3333-3333-333333333333
+
+    # Shared by every application above that resolves groups from the directory.
+    graph:
+      # Also the lag before a group removal takes effect.
+      cacheTTL: 10m
+      negativeCacheTTL: 30s
+      # Refuse rather than guess when the directory is unreachable.
+      failureMode: closed
+
+    dynamicClientRegistration:
+      enabled: true
+      staticClientID: 33333333-3333-3333-3333-333333333333
+
+  # Keep the rules in their own ConfigMap so they can be reviewed and rolled
+  # separately from the endpoints and credentials.
+  separatePolicyConfigMap: true
+
+  policy:
+    defaultEffect: deny
+    rules:
+      - name: block-destructive-tools
+        effect: deny
+        methods: ["tools/call"]
+        tools: ["delete_*", "drain_node", "bash_*", "exec_*"]
+
+      - name: protocol-handshake
+        effect: allow
+        methods: ["initialize", "initialized", "ping", "notifications/*"]
+
+      - name: readers
+        effect: allow
+        methods: ["tools/list", "resources/*", "prompts/*"]
+        groups:
+          - 6f0d8f0e-0000-0000-0000-000000000002   # mcp-readers
+
+      - name: operators
+        effect: allow
+        methods: ["tools/call"]
+        tools: ["kubectl_get*", "kubectl_describe*", "kubectl_logs*", "prometheus_*"]
+        groups:
+          - 6f0d8f0e-0000-0000-0000-000000000003   # mcp-operators
+
+      - name: pipeline
+        effect: allow
+        appOnly: true
+        methods: ["tools/call", "tools/list"]
+        tools: ["kubectl_get*"]
+        roles: ["Mcp.Invoke.All"]
+
+ingress:
+  enabled: true
+  className: nginx
+  host: mcp.example.com
+  annotations:
+    # Server-sent events must not be buffered or cut short.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls:
+    enabled: true
+    secretName: mcp-example-com-tls
+
+networkPolicy:
+  enabled: true
+
+serviceMonitor:
+  enabled: true
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: mcp-oauth-proxy

@@ -1,0 +1,308 @@
+# Sidecar deployment: the MCP server listens only on loopback, so every request
+# from outside the pod must pass through the OAuth proxy container.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-server
+  namespace: mcp
+  annotations:
+    # Read by the Azure Workload Identity webhook, which projects a service
+    # account token into the pod and exports AZURE_FEDERATED_TOKEN_FILE. The
+    # identity below must hold the GroupMember.Read.All *application*
+    # permission, with admin consent granted.
+    azure.workload.identity/client-id: "99999999-9999-9999-9999-999999999999"
+    azure.workload.identity/tenant-id: "11111111-1111-1111-1111-111111111111"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-oauth-proxy-config
+  namespace: mcp
+data:
+  config.yaml: |
+    server:
+      listenAddr: ":8080"
+      metricsAddr: ":9090"
+      # Transitive membership can run to hundreds of groups. Keep the forwarded
+      # header inside the 4-8 KiB buffers a typical ingress controller allows.
+      maxGroupsHeaderBytes: 2048
+    upstream:
+      url: "http://127.0.0.1:3000"
+    log:
+      level: info
+      format: json
+
+    authorization:
+      oauth2:
+        # Canonical public URL of the MCP endpoint. This value is the OAuth
+        # resource identifier and determines the RFC 9728 metadata location.
+        resource: "https://mcp.example.com/mcp"
+        resourceName: "Platform MCP Server"
+        # Entra ID ignores the RFC 8707 `resource` parameter, so clients ask for
+        # `<app-id-uri>/<scope>`. The scope plays no part in the authorization
+        # decision; it exists so that clients have something to request.
+        scopesSupported:
+          - "api://22222222-2222-2222-2222-222222222222/mcp.access"
+
+        # The coarse gate. A caller must be a transitive member of at least one
+        # of these groups before any request reaches the MCP server. Object ids
+        # are preferred because display names are mutable and not unique; a
+        # `name:` alias is resolved to an object id once, at startup.
+        allowGroups:
+          - "6f0d8f0e-0000-0000-0000-000000000001"   # mcp-users
+
+        oauth2Client:
+          - tenantID: "11111111-1111-1111-1111-111111111111"
+            clientID: "22222222-2222-2222-2222-222222222222"
+            # Both the Application ID URI and the bare client id are accepted,
+            # because Entra ID mints either depending on how the client asked.
+            audience:
+              - "api://22222222-2222-2222-2222-222222222222"
+              - "22222222-2222-2222-2222-222222222222"
+
+        # One Graph block for the whole deployment, shared by every application
+        # above that uses groupsSource: msgraph. The proxy calls Graph as itself
+        # rather than on behalf of the caller, and an app-only credential can
+        # only read the directory of its own tenant.
+        graph:
+          # Also the propagation delay for a group removal: a user keeps their
+          # access for at most this long after being removed.
+          cacheTTL: 10m
+          # Refuse requests rather than guess when Graph is unreachable.
+          failureMode: closed
+          credential:
+            type: federated
+            clientID: "99999999-9999-9999-9999-999999999999"
+            tenantID: "11111111-1111-1111-1111-111111111111"
+
+      policy:
+        defaultEffect: deny
+        rulesFile: /etc/mcp-proxy-policy/rules.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-oauth-proxy-policy
+  namespace: mcp
+data:
+  # Rules are evaluated in order, first match wins, so a deny placed above the
+  # allows cannot be overtaken by a later rule.
+  rules.yaml: |
+    rules:
+      - name: block-destructive-tools
+        effect: deny
+        methods: ["tools/call"]
+        tools: ["delete_*", "drain_node", "bash_*"]
+      - name: protocol-handshake
+        effect: allow
+        methods: ["initialize", "initialized", "ping", "notifications/*"]
+      - name: readers
+        effect: allow
+        methods: ["tools/list", "resources/*", "prompts/*"]
+        groups: ["6f0d8f0e-0000-0000-0000-000000000002"]   # mcp-readers
+      - name: cluster-operators
+        effect: allow
+        methods: ["tools/call"]
+        tools: ["kubectl_get*", "kubectl_describe*", "prometheus_*"]
+        groups: ["6f0d8f0e-0000-0000-0000-000000000003"]   # mcp-operators
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-server
+  namespace: mcp
+  labels:
+    app.kubernetes.io/name: mcp-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mcp-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mcp-server
+        # Tells the Azure Workload Identity webhook to mutate this pod.
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: mcp-server
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: oauth-proxy
+          image: ghcr.io/example/mcp-oauth-proxy:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/mcp-proxy/config.yaml"]
+          ports:
+            - name: https
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mcp-proxy
+              readOnly: true
+            - name: policy
+              mountPath: /etc/mcp-proxy-policy
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+
+        - name: mcp-server
+          image: ghcr.io/example/my-mcp-server:latest
+          # Binding to loopback is what makes the proxy unbypassable inside the pod.
+          args: ["--host", "127.0.0.1", "--port", "3000"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: mcp-oauth-proxy-config
+        - name: policy
+          configMap:
+            name: mcp-oauth-proxy-policy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-server
+  namespace: mcp
+  labels:
+    app.kubernetes.io/name: mcp-server
+spec:
+  selector:
+    app.kubernetes.io/name: mcp-server
+  ports:
+    # Only the proxy port is published; port 3000 is deliberately absent.
+    - name: https
+      port: 443
+      targetPort: https
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-server-metrics
+  namespace: mcp
+  labels:
+    app.kubernetes.io/name: mcp-server
+spec:
+  selector:
+    app.kubernetes.io/name: mcp-server
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcp-server
+  namespace: mcp
+  annotations:
+    # SSE must not be buffered or cut short by the ingress controller.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["mcp.example.com"]
+      secretName: mcp-server-tls
+  rules:
+    - host: mcp.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp-server
+                port:
+                  name: https
+---
+# Defence in depth: nothing in the cluster may reach the pod except the ingress
+# controller, so the loopback-bound MCP server cannot be reached laterally.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-server
+  namespace: mcp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mcp-server
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090
+  egress:
+    # DNS plus outbound HTTPS so the proxy can reach login.microsoftonline.com
+    # for the discovery document and JWKS, and graph.microsoft.com to resolve
+    # group membership. Without the latter the proxy fails closed and every
+    # request is answered with 503.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: 443

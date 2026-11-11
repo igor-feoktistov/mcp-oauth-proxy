@@ -1,0 +1,11 @@
+apiVersion: v2
+name: mcp-oauth-proxy
+description: Entra ID OAuth 2.1 resource-server sidecar that secures an MCP server with no built-in authorization
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - mcp
+  - oauth2
+  - entra-id
+  - security

@@ -1,0 +1,46 @@
+{{- include "mcp-oauth-proxy.validate" . -}}
+{{- $oauth2 := include "mcp-oauth-proxy.oauth2" . | fromYaml -}}
+{{- $policy := deepCopy .Values.authorization.policy -}}
+{{- if include "mcp-oauth-proxy.usePolicyFile" . -}}
+{{- $policy = dict "defaultEffect" .Values.authorization.policy.defaultEffect "rulesFile" "/etc/mcp-proxy-policy/rules.yaml" -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mcp-oauth-proxy.fullname" . }}
+  labels:
+    {{- include "mcp-oauth-proxy.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    server:
+      listenAddr: ":8080"
+      metricsAddr: ":9090"
+      maxBodyBytes: {{ .Values.server.maxBodyBytes }}
+      maxGroupsHeaderBytes: {{ .Values.server.maxGroupsHeaderBytes }}
+      {{- with .Values.server.allowedOrigins }}
+      allowedOrigins:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    upstream:
+      url: {{ printf "http://127.0.0.1:%d" (int .Values.mcpServer.port) | quote }}
+    log:
+      level: {{ .Values.logging.level | quote }}
+      format: {{ .Values.logging.format | quote }}
+    authorization:
+      oauth2:
+        {{- toYaml $oauth2 | nindent 8 }}
+      policy:
+        {{- toYaml $policy | nindent 8 }}
+{{- if and (include "mcp-oauth-proxy.usePolicyFile" .) (not .Values.authorization.existingPolicyConfigMap) }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mcp-oauth-proxy.policyConfigMapName" . }}
+  labels:
+    {{- include "mcp-oauth-proxy.labels" . | nindent 4 }}
+data:
+  rules.yaml: |
+    rules:
+      {{- toYaml .Values.authorization.policy.rules | nindent 6 }}
+{{- end }}
